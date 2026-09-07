@@ -1,4 +1,3 @@
-[sw.js](https://github.com/user-attachments/files/31886709/sw.js)
 /* VOIDCRAFT — офлайн-кеш. Гра лежить в одному файлі, тому кешувати
    треба небагато: сама сторінка, іконки й маніфест.                */
 var CACHE = 'voidcraft-v1';
