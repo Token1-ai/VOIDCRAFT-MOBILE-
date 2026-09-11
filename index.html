@@ -4876,8 +4876,11 @@ const _dir=new THREE.Vector3();
 function raycastBlock(){
     camera.getWorldPosition(_origin);
     camera.getWorldDirection(_dir);
-    const ox=_origin.x, oy=_origin.y, oz=_origin.z;
-    const dx=_dir.x, dy=_dir.y, dz=_dir.z;
+    return raycastBlockFrom(_origin.x,_origin.y,_origin.z,_dir.x,_dir.y,_dir.z);
+}
+/* Той самий промінь, але з довільної точки й напрямку — потрібен для
+   будівництва тапом по екрану на телефоні.                          */
+function raycastBlockFrom(ox,oy,oz,dx,dy,dz){
 
     let x=Math.round(ox), y=Math.round(oy), z=Math.round(oz);
     const stepX=dx>0?1:(dx<0?-1:0);
@@ -4907,7 +4910,7 @@ function raycastBlock(){
                 return {
                     breakX:x, breakY:y, breakZ:z,
                     placeX:x+best.nx, placeY:y+best.ny, placeZ:z+best.nz,
-                    normalY:best.ny,
+                    normalY:best.ny, normalX:best.nx, normalZ:best.nz,
                     isTopSlab:bestPart==='top',
                     distance:best.t
                 };
@@ -5260,9 +5263,13 @@ function updatePreview(){
 
 function renderPreview(){
   if(!previewScene || backpackOpen) return;
-  const w=PREVIEW_SIZE, h=PREVIEW_SIZE;
-  const vx=innerWidth-w-18;
-  const vy=98;
+  // На телефоні кубик має бути маленьким і в іншому куті, тому місце
+  // й розмір можна задати ззовні через window.__vcPreview={size,x,y}
+  // (x — від лівого краю, y — від НИЖНЬОГО, як у WebGL).
+  const cfg=(typeof window!=='undefined')?window.__vcPreview:null;
+  const w=(cfg&&cfg.size)?cfg.size:PREVIEW_SIZE, h=w;
+  const vx=(cfg&&typeof cfg.x==='number')?cfg.x:(innerWidth-w-18);
+  const vy=(cfg&&typeof cfg.y==='number')?cfg.y:98;
   if(vx<0||vy<0) return;
   renderer.setScissorTest(true);
   renderer.setViewport(vx,vy,w,h);
@@ -9984,8 +9991,18 @@ boot();
     }
   }, 50);
 
+  var PREV = 64;                    // розмір кубика вибраного блока
+
+  function placePreviewBox() {
+    // WebGL рахує Y від низу, тому «зверху зліва» = innerHeight - розмір - відступ
+    window.__vcPreview = { size: PREV, x: 10, y: Math.max(0, window.innerHeight - PREV - 50) };
+  }
+
   function start() {
     document.documentElement.classList.add('vc-touch');
+    placePreviewBox();
+    window.addEventListener('resize', placePreviewBox);
+    window.addEventListener('orientationchange', function () { setTimeout(placePreviewBox, 250); });
     injectCSS();
     var ui = injectUI();
     bindLook(ui);
@@ -10005,6 +10022,51 @@ boot();
   var toolT = 0;
   var last = 0;
   var _euler = null;
+  var tapX = 0, tapY = 0, tapT = 0, tapMoved = false, tapHandled = false, tapTimer = 0;
+
+  /* Промінь із точки, куди тицьнув палець — а не з центру екрана.
+     Завдяки цьому будувати можна просто тикаючи в потрібне місце,
+     не наводячи спершу приціл. Довгий натиск ламає.               */
+  function actAtPoint(px, py, what) {
+    if (!playing() || typeof raycastBlockFrom !== 'function') return;
+    if (typeof renderer === 'undefined' || !renderer || !window.THREE) return;
+    var r = renderer.domElement.getBoundingClientRect();
+    var nx = ((px - r.left) / r.width) * 2 - 1;
+    var ny = -((py - r.top) / r.height) * 2 + 1;
+    var v = new THREE.Vector3(nx, ny, 0.5).unproject(camera);
+    var o = new THREE.Vector3();
+    camera.getWorldPosition(o);
+    v.sub(o).normalize();
+    var hit = raycastBlockFrom(o.x, o.y, o.z, v.x, v.y, v.z);
+    if (!hit) return;
+
+    if (what === 'break') {
+      if (typeof removeBlock !== 'function') return;
+      if (hit.breakY < (typeof WORLD_FLOOR_Y !== 'undefined' ? WORLD_FLOOR_Y : -9999)) return;
+      var d = blocks.get(keyOf(hit.breakX, hit.breakY, hit.breakZ));
+      if (d && typeof DOOR_TYPES !== 'undefined' && DOOR_TYPES.has(d.type)) {
+        var other = d.half === 'top' ? hit.breakY - 1 : hit.breakY + 1;
+        var od = blocks.get(keyOf(hit.breakX, other, hit.breakZ));
+        if (od && DOOR_TYPES.has(od.type)) removeBlock(hit.breakX, other, hit.breakZ);
+      }
+      if (d && typeof sfxBreak === 'function') sfxBreak(d.type);
+      removeBlock(hit.breakX, hit.breakY, hit.breakZ, hit.isTopSlab ? 'top' : undefined);
+      if (navigator.vibrate) { try { navigator.vibrate(18); } catch (e) {} }
+      return;
+    }
+
+    if (typeof resolvePlacement !== 'function' || typeof placeBlockAt !== 'function') return;
+    if (typeof autoRotForFace === 'function') _placeRot = autoRotForFace(hit, selectedBlockType);
+    var spot = resolvePlacement(hit);
+    if (spot.replace) {
+      if (typeof isInsidePlayer === 'function' && isInsidePlayer(spot.x, spot.y, spot.z)) {
+        _placeRot = null; return;
+      }
+      removeBlock(spot.x, spot.y, spot.z);
+    }
+    placeBlockAt(spot.x, spot.y, spot.z, spot.fillSlab);
+    _placeRot = null;
+  }
 
   function playing() {
     return typeof isPlaying === 'function' ? isPlaying() : false;
@@ -10045,6 +10107,18 @@ boot();
       '#vc-down{width:52px;height:52px;right:186px;bottom:26px;}',
       '#vc-fly{width:50px;height:50px;right:110px;bottom:104px;}',
       '#vc-run{width:50px;height:50px;right:186px;bottom:96px;}',
+      /* кнопка «сховати керування» */
+      '#vc-hide{position:absolute;right:max(6px,env(safe-area-inset-right));top:50%;',
+      '  margin-top:-22px;width:34px;height:44px;border-radius:10px;font-size:17px;',
+      '  pointer-events:auto;display:flex;align-items:center;justify-content:center;',
+      '  background:rgba(16,20,28,.42);border:1.5px solid rgba(190,215,255,.28);',
+      '  color:#dce8ff;backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);',
+      '  transition:background .1s,opacity .2s;z-index:62;}',
+      '#vc-hide.hit{background:rgba(90,150,235,.62);}',
+      '#vc-pad.folded #vc-act,#vc-pad.folded #vc-top{opacity:0;pointer-events:none;',
+      '  transform:translateX(26px);}',
+      '#vc-act,#vc-top{transition:opacity .18s,transform .18s;}',
+      '#vc-pad.folded #vc-hide{opacity:.55;}',
       /* верхній ряд */
       '#vc-top{position:absolute;right:max(12px,env(safe-area-inset-right));',
       '  top:max(10px,env(safe-area-inset-top));display:flex;gap:9px;pointer-events:none;}',
@@ -10052,7 +10126,7 @@ boot();
       /* ---- розкладка інтерфейсу гри під малий екран ---- */
       'html.vc-touch #help{display:none!important;}',
       'html.vc-touch #status{top:6px!important;left:8px!important;font-size:10px!important;',
-      '  line-height:1.45!important;padding:5px 8px!important;opacity:.8;max-width:46vw;}',
+      '  line-height:1.35!important;padding:4px 7px!important;opacity:.72;max-width:62vw;}',
       /* на телефоні показуємо 4 слоти замість 9 — решта блоків у рюкзаку */
       'html.vc-touch #slot-7,html.vc-touch #slot-8,',
       'html.vc-touch #slot-9{display:none!important;}',
@@ -10064,11 +10138,11 @@ boot();
       '  right:10px!important;top:60px!important;transform:scale(.27)!important;',
       '  transform-origin:right top;opacity:.9;}',
       'html.vc-touch #map-label{font-size:22px!important;}',
-      /* вікно попереднього перегляду блоку — маленьке, під картою */
-      'html.vc-touch #preview-frame{right:10px!important;bottom:auto!important;',
-      '  top:130px!important;width:70px!important;height:70px!important;opacity:.85;}',
-      'html.vc-touch #preview-label{right:10px!important;bottom:auto!important;',
-      '  top:203px!important;width:70px!important;font-size:9px!important;}',
+      /* рамка не потрібна: сам кубик малюється у 3D-полотні */
+      'html.vc-touch #preview-frame{display:none!important;}',
+      'html.vc-touch #preview-label{right:auto!important;bottom:auto!important;',
+      '  left:10px!important;top:118px!important;width:64px!important;',
+      '  font-size:9px!important;opacity:.75;}',
       'html.vc-touch #toast{top:70px!important;font-size:12px!important;}',
       /* підказка */
       '#vc-hint{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:61;',
@@ -10095,6 +10169,7 @@ boot();
       '  <div class="b sm" id="vc-fly" style="position:absolute">✈</div>' +
       '  <div class="b sm" id="vc-run" style="position:absolute">»</div>' +
       '</div>' +
+      '<div id="vc-hide">‹</div>' +
       '<div id="vc-top">' +
       '  <div class="b sm" id="vc-bag">🎒</div>' +
       '  <div class="b sm" id="vc-map">🗺</div>' +
@@ -10134,6 +10209,7 @@ boot();
       var el = document.elementFromPoint(t.clientX, t.clientY);
       while (el) {
         if (el.id === 'vc-pad' || el.id === 'vc-stick' || el.id === 'vc-act' ||
+            el.id === 'vc-hide' ||
             el.id === 'vc-top' || (el.classList && el.classList.contains('b'))) return false;
         if (el.id === 'hotbar' || el.id === 'backpack' || el.id === 'instructions') return false;
         el = el.parentElement;
@@ -10146,6 +10222,13 @@ boot();
       var t = e.changedTouches[0];
       if (!free(t)) return;
       id = t.identifier; px = t.clientX; py = t.clientY;
+      // для розпізнавання тапу й довгого натиску
+      tapX = t.clientX; tapY = t.clientY; tapT = Date.now();
+      tapMoved = false; tapHandled = false;
+      clearTimeout(tapTimer);
+      tapTimer = setTimeout(function () {
+        if (!tapMoved && !tapHandled) { tapHandled = true; actAtPoint(tapX, tapY, 'break'); }
+      }, 380);
     }, { passive: true });
 
     document.addEventListener('touchmove', function (e) {
@@ -10156,12 +10239,23 @@ boot();
         lookDX += t.clientX - px;
         lookDY += t.clientY - py;
         px = t.clientX; py = t.clientY;
+        if (Math.abs(t.clientX - tapX) > 12 || Math.abs(t.clientY - tapY) > 12) {
+          tapMoved = true; clearTimeout(tapTimer);
+        }
       }
     }, { passive: true });
 
     function end(e) {
-      for (var i = 0; i < e.changedTouches.length; i++)
-        if (e.changedTouches[i].identifier === id) id = null;
+      for (var i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier !== id) continue;
+        id = null;
+        clearTimeout(tapTimer);
+        // короткий тап без руху — поставити блок саме туди, куди тицьнув
+        if (!tapMoved && !tapHandled && Date.now() - tapT < 380) {
+          tapHandled = true;
+          actAtPoint(tapX, tapY, 'place');
+        }
+      }
     }
     document.addEventListener('touchend', end, { passive: true });
     document.addEventListener('touchcancel', end, { passive: true });
@@ -10285,6 +10379,23 @@ boot();
     tap('vc-menu', function () {
       if (typeof gpOpenMenu === 'function') gpOpenMenu();
     });
+
+    // Сховати / показати праві кнопки. Вибір запам'ятовується.
+    var pad = document.getElementById('vc-pad');
+    var hideBtn = document.getElementById('vc-hide');
+    function applyFold(folded) {
+      pad.classList.toggle('folded', folded);
+      hideBtn.textContent = folded ? '›' : '‹';
+      try { localStorage.setItem('vc_folded', folded ? '1' : '0'); } catch (e) {}
+    }
+    var startFolded = false;
+    try { startFolded = localStorage.getItem('vc_folded') === '1'; } catch (e) {}
+    applyFold(startFolded);
+    tap('vc-hide', function () {
+      var now = !pad.classList.contains('folded');
+      applyFold(now);
+      say(now ? 'Кнопки сховано — будуй тапом' : 'Кнопки повернуто');
+    });
   }
 
   /* ---------------------------------------------------------------- */
@@ -10320,6 +10431,7 @@ boot();
       setTimeout(function () {
         if (typeof gpStartPlaying === 'function') gpStartPlaying();
         if (typeof gpPlaying !== 'undefined') gpPlaying = true;
+        say('Тапни по світу — поставити. Затисни — зламати.');
       }, 40);
     }, { passive: false });
 
